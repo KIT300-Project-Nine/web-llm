@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { MLCEngineInterface } from "../types";
+import { MLCEngineInterface, LatencyBreakdown } from "../types";
 import {
   functionCallingModelIds,
   MessagePlaceholders,
@@ -30,6 +30,7 @@ import {
   CustomSystemPromptError,
   InvalidResponseFormatError,
   InvalidResponseFormatGrammarError,
+  InvalidResponseFormatStructuralTagError,
   InvalidStreamOptionsError,
   MessageOrderError,
   MultipleTextContentError,
@@ -42,6 +43,7 @@ import {
   UnsupportedModelIdError,
   UserMessageContentErrorForNonVLM,
 } from "../error";
+import type { StructuralTagLike } from "@mlc-ai/web-xgrammar";
 
 /* eslint-disable @typescript-eslint/no-namespace */
 
@@ -124,6 +126,13 @@ export interface ChatCompletionRequestBase {
    * [See more information about frequency and presence penalties.](https://platform.openai.com/docs/guides/text-generation/parameter-details)
    */
   presence_penalty?: number | null;
+
+  /**
+   * Penalizes new tokens based on whether they appear in the prompt and the
+   * generated text so far. Values greater than 1.0 encourage the model to use new
+   * tokens, while values less than 1.0 encourage the model to repeat tokens.
+   */
+  repetition_penalty?: number | null;
 
   /**
    * The maximum number of [tokens](/tokenizer) that can be generated in the chat
@@ -268,6 +277,12 @@ export interface ChatCompletionRequestBase {
      * @note Currently only allowed to be used for Qwen3 models, though not explicitly checked.
      */
     enable_thinking?: boolean | null;
+
+    /**
+     * If set to true, the response will include a breakdown of the time spent in various
+     * stages of token sampling.
+     */
+    enable_latency_breakdown?: boolean | null;
   };
 }
 
@@ -511,6 +526,24 @@ export function postInitAndCheckFields(
       request.response_format?.grammar === null
     ) {
       throw new InvalidResponseFormatGrammarError();
+    }
+  }
+
+  if (
+    request.response_format?.structural_tag !== undefined &&
+    request.response_format?.structural_tag !== null
+  ) {
+    if (request.response_format?.type !== "structural_tag") {
+      throw new InvalidResponseFormatStructuralTagError();
+    }
+  }
+
+  if (request.response_format?.type === "structural_tag") {
+    if (
+      request.response_format?.structural_tag === undefined ||
+      request.response_format?.structural_tag === null
+    ) {
+      throw new InvalidResponseFormatStructuralTagError();
     }
   }
 
@@ -980,6 +1013,12 @@ export interface CompletionUsage {
      * structured output. If n > 1, it is the average over all choices.
      */
     grammar_per_token_s?: number;
+
+    /**
+     * If `enable_latency_breakdown` is set to true in the request, this field will be
+     * present and contain a breakdown of the time spent in various stages of token sampling.
+     */
+    latencyBreakdown?: LatencyBreakdown;
   };
 }
 
@@ -1138,6 +1177,10 @@ export namespace ChatCompletionChunk {
  * Setting to `{ "type": "grammar" }` requires you to also specify the `grammar` field, which
  * is a BNFGrammar string.
  *
+ * Setting to `{ "type": "structural_tag" }` requires a `structural_tag` definition that
+ * applies trigger-based constraints (e.g. tag-delimited blocks) while allowing free-form text
+ * outside the triggered spans.
+ *
  * Setting `schema` specifies the output format of the json object such as properties to include.
  *
  * **Important:** when using JSON mode, you **must** also instruct the model to produce JSON
@@ -1150,9 +1193,9 @@ export namespace ChatCompletionChunk {
  */
 export interface ResponseFormat {
   /**
-   * Must be one of `text`, `json_object`, or `grammar`.
+   * Must be one of `text`, `json_object`, `grammar`, or `structural_tag`.
    */
-  type?: "text" | "json_object" | "grammar";
+  type?: "text" | "json_object" | "grammar" | "structural_tag";
   /**
    * A schema string in the format of the schema of a JSON file. `type` needs to be `json_object`.
    */
@@ -1172,4 +1215,9 @@ export interface ResponseFormat {
       The assertion (=[a-z]) means a must be followed by [a-z].
    */
   grammar?: string;
+  /**
+   * A structural tag definition. Needs to be specified when, and only when,
+   * `type` is `structural_tag`.
+   */
+  structural_tag?: StructuralTagLike | string;
 }

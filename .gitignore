@@ -324,5 +324,5 @@ node_modules
 lib
 .parcel-cache
 
-examples/tests
 **/.next
+coverage

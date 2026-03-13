@@ -1,12 +1,10 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
-/* eslint-disable no-prototype-builtins */
 import * as tvmjs from "@mlc-ai/web-runtime";
 import * as xgr from "@mlc-ai/web-xgrammar";
 import log from "loglevel";
 import { Tokenizer } from "@mlc-ai/web-tokenizers";
 import { ChatConfig, GenerationConfig, Role } from "./config";
 import { getConversation, Conversation } from "./conversation";
-import { LogitProcessor } from "./types";
+import { LogitProcessor, LatencyBreakdown } from "./types";
 import {
   getChunkedPrefillInputData,
   getImageDataFromURL,
@@ -50,6 +48,12 @@ export class LLMChatPipeline {
   private image_embed: tvmjs.PackedFunc | undefined;
   private embed: tvmjs.PackedFunc;
   private fapplyBitmask: tvmjs.PackedFunc;
+  private fapplyPenalty: tvmjs.PackedFunc;
+  private fapplyLogitBias: tvmjs.PackedFunc;
+  private fsoftmaxWithTemperature: tvmjs.PackedFunc;
+  private fsampleWithTopP: tvmjs.PackedFunc;
+  private fargsortProbs: tvmjs.PackedFunc;
+
   // Functions related to PagedKVCache
   private fclearKVCaches: tvmjs.PackedFunc;
   private fKVCacheAddSequence: tvmjs.PackedFunc;
@@ -61,7 +65,7 @@ export class LLMChatPipeline {
   // parameter states
   private params: tvmjs.TVMObject;
   private kvCache: tvmjs.TVMObject;
-  private logitsOnCPU?: tvmjs.NDArray = undefined;
+  private logitsOnCPU?: tvmjs.Tensor = undefined;
   private filledKVCacheLength = 0;
 
   // meta data
@@ -98,6 +102,16 @@ export class LLMChatPipeline {
   private curRoundDecodingTotalTime = 0;
   private curRoundPrefillTotalTime = 0;
 
+  // additional stats, reset at every prefillStep()
+  public curRoundLatencyBreakdown: LatencyBreakdown = {
+    logitProcessorTime: [],
+    logitBiasTime: [],
+    penaltyTime: [],
+    sampleTime: [],
+    totalTime: [],
+    grammarBitmaskTime: [],
+  };
+
   // LogitProcessor
   private logitProcessor?: LogitProcessor = undefined;
 
@@ -105,10 +119,10 @@ export class LLMChatPipeline {
   // A grammar matcher for this current round if response_format is set. Reinitialized upon
   // each step regardless of whether the chat is multi-round or not.
   private grammarMatcher?: xgr.GrammarMatcher = undefined;
-  // The current schema or grammar string used for grammarMatcher; if undefined, grammarMatcher is
-  // simply using JSON mode. We use this field to determine whether we re-initiate a GrammarMatcher
-  // or simply reset the state during each round (i.e. during prefillStep).
-  private schemaOrGrammarStr?: string = undefined;
+  // Cache key of the current response_format (schema / grammar / structural tag). If undefined,
+  // grammarMatcher is simply using JSON mode. We use this field to determine whether we re-initiate
+  // a GrammarMatcher or simply reset during each round (i.e. during prefillStep).
+  private responseFormatCacheKey?: string = undefined;
   // A string list of tokens ordered by their token id, post-processed. Once initialized, will not
   // be reinitialized since `this.tokenizer` does not change throughout the lifetime of LLMChatPipeline.
   private xgTokenizerInfo?: xgr.TokenizerInfo = undefined;
@@ -128,6 +142,10 @@ export class LLMChatPipeline {
   private curRoundGrammarInitTotalTime = 0;
   // Total time of getting next bitmask and accepting token in seconds
   private curRoundGrammarPerTokenTotalTime = 0;
+  // Instance variables for supporting sampling on WebGPU
+  private sampleIndices: Int32Array;
+  private sampleIndicesDevice: tvmjs.Tensor;
+  private topPDevice: tvmjs.Tensor;
 
   constructor(
     tvm: tvmjs.Instance,
@@ -190,6 +208,21 @@ export class LLMChatPipeline {
     this.fapplyBitmask = this.tvm.detachFromCurrentScope(
       this.vm.getFunction("apply_bitmask_inplace"),
     );
+    this.fapplyPenalty = this.tvm.detachFromCurrentScope(
+      this.vm.getFunction("apply_penalty_inplace"),
+    );
+    this.fapplyLogitBias = this.tvm.detachFromCurrentScope(
+      this.vm.getFunction("apply_logit_bias_inplace"),
+    );
+    this.fsoftmaxWithTemperature = this.tvm.detachFromCurrentScope(
+      this.vm.getFunction("softmax_with_temperature"),
+    );
+    this.fsampleWithTopP = this.tvm.detachFromCurrentScope(
+      this.vm.getFunction("sample_with_top_p"),
+    );
+    this.fargsortProbs = this.tvm.detachFromCurrentScope(
+      this.vm.getFunction("argsort_probs"),
+    );
     try {
       this.image_embed = this.tvm.detachFromCurrentScope(
         this.vm.getFunction("image_embed"),
@@ -201,7 +234,7 @@ export class LLMChatPipeline {
     // 2. Get json stored in the vm's metadata function
     const fgetMetadata = this.vm.getFunction("_metadata");
     const ret_value = fgetMetadata();
-    const metadataStr = this.tvm.detachFromCurrentScope(ret_value).toString();
+    const metadataStr = ret_value.toString();
     const metadata = JSON.parse(metadataStr);
 
     // 3. Load parameters by name
@@ -287,6 +320,25 @@ export class LLMChatPipeline {
 
     this.filledKVCacheLength = 0;
     this.resetChat(); // especially needed for PagedKVCache as we need to call fKVCacheAddSequence
+
+    // Initialize WebGPU sampling related device tensors
+    const numSamples = 1;
+    const numProbs = 1;
+
+    this.sampleIndices = new Int32Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+      this.sampleIndices[i] = i;
+    }
+    this.sampleIndicesDevice = this.tvm.detachFromCurrentScope(
+      this.tvm
+        .empty([numSamples], "int32", this.device)
+        .copyFrom(this.sampleIndices),
+    );
+
+    this.topPDevice = this.tvm.detachFromCurrentScope(
+      this.tvm.empty([numProbs], "float32", this.device),
+    );
+
     tvm.endScope();
   }
 
@@ -422,6 +474,13 @@ export class LLMChatPipeline {
   }
 
   /**
+   * @returns the breakdown of latencies for sampling each token for a single request.
+   */
+  getCurRoundLatencyBreakdown(): LatencyBreakdown {
+    return this.curRoundLatencyBreakdown;
+  }
+
+  /**
    * @returns Runtime stats information.
    */
   runtimeStatsText(): string {
@@ -460,6 +519,30 @@ export class LLMChatPipeline {
    */
   setSeed(seed: number): void {
     this.tvm.setSeed(seed);
+  }
+
+  private getResponseFormatKey(
+    responseFormat?: ResponseFormat | null,
+  ): string | undefined {
+    if (!responseFormat) {
+      return undefined;
+    }
+    if (responseFormat.type === "json_object") {
+      return responseFormat.schema ?? undefined;
+    }
+    if (responseFormat.type === "grammar") {
+      return responseFormat.grammar ?? undefined;
+    }
+    if (responseFormat.type === "structural_tag") {
+      const structuralTag = responseFormat.structural_tag;
+      if (structuralTag === undefined || structuralTag === null) {
+        return undefined;
+      }
+      return typeof structuralTag === "string"
+        ? structuralTag
+        : JSON.stringify(structuralTag);
+    }
+    return undefined;
   }
 
   // Getters and setters for this.conversation.
@@ -514,20 +597,31 @@ export class LLMChatPipeline {
     this.curRoundDecodingTotalTime = 0;
     this.curRoundGrammarInitTotalTime = 0;
     this.curRoundGrammarPerTokenTotalTime = 0;
+
+    this.curRoundLatencyBreakdown = {
+      logitProcessorTime: [],
+      logitBiasTime: [],
+      penaltyTime: [],
+      sampleTime: [],
+      totalTime: [],
+      grammarBitmaskTime: [],
+    };
+
     this.stopTriggered = false;
     const conversation = this.conversation;
 
     // -1. Instantiate grammar matcher according to generation config. This step is overlapped
     // with prefilling the prompt to hide overhead by using this promise.
     let grammarMatcherInitPromise: Promise<void> | undefined = undefined;
+    const responseFormat = genConfig?.response_format;
     if (
-      genConfig?.response_format?.type === "json_object" ||
-      genConfig?.response_format?.type === "grammar"
+      responseFormat?.type === "json_object" ||
+      responseFormat?.type === "grammar" ||
+      responseFormat?.type === "structural_tag"
     ) {
-      const curSchemaOrGrammarStr =
-        genConfig.response_format.schema || genConfig.response_format.grammar;
+      const curResponseFormatKey = this.getResponseFormatKey(responseFormat);
       if (
-        curSchemaOrGrammarStr === this.schemaOrGrammarStr &&
+        curResponseFormatKey === this.responseFormatCacheKey &&
         this.grammarMatcher
       ) {
         // If we did not change the schema and have instantiated a GrammarMatcher, we reuse it.
@@ -562,19 +656,23 @@ export class LLMChatPipeline {
               );
           }
           const grammar: xgr.CompiledGrammar =
-            curSchemaOrGrammarStr === undefined
+            responseFormat.type === undefined
               ? await this.grammarCompiler!.compileBuiltinJSONGrammar()
-              : genConfig?.response_format?.type === "json_object"
+              : responseFormat.type === "json_object"
                 ? await this.grammarCompiler!.compileJSONSchema(
-                    curSchemaOrGrammarStr,
+                    responseFormat.schema!,
                   )
-                : await this.grammarCompiler!.compileGrammar(
-                    curSchemaOrGrammarStr,
-                  );
+                : responseFormat.type === "grammar"
+                  ? await this.grammarCompiler!.compileGrammar(
+                      responseFormat.grammar!,
+                    )
+                  : await this.grammarCompiler!.compileStructuralTag(
+                      responseFormat.structural_tag!,
+                    );
           this.grammarMatcher =
             await xgr.GrammarMatcher.createGrammarMatcher(grammar);
           grammar.dispose();
-          this.schemaOrGrammarStr = curSchemaOrGrammarStr;
+          this.responseFormatCacheKey = curResponseFormatKey;
           this.curRoundGrammarInitTotalTime =
             (performance.now() - tGrammarInitStart) / 1e3;
           resolve();
@@ -631,7 +729,7 @@ export class LLMChatPipeline {
 
     // 2. Prefill each chunk
     this.tvm.beginScope();
-    let logits: tvmjs.NDArray;
+    let logits: tvmjs.Tensor;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const chunkLen = chunkLens[i];
@@ -820,7 +918,7 @@ export class LLMChatPipeline {
    * @note precondition: inputTokens.length <= prefillChunkSize, since we take care of
    * chunking in `getChunkedPrefillInputData()`.
    */
-  private getTokensEmbeddings(inputTokens: number[]): tvmjs.NDArray {
+  private getTokensEmbeddings(inputTokens: number[]): tvmjs.Tensor {
     this.tvm.beginScope();
     if (inputTokens.length > this.prefillChunkSize) {
       throw new Error(
@@ -833,7 +931,7 @@ export class LLMChatPipeline {
       this.device,
     );
     inputData.copyFrom(inputTokens);
-    const embed: tvmjs.NDArray = this.tvm.detachFromCurrentScope(
+    const embed: tvmjs.Tensor = this.tvm.detachFromCurrentScope(
       this.embed!(inputData, this.params),
     );
     this.tvm.endScope();
@@ -842,26 +940,83 @@ export class LLMChatPipeline {
   }
 
   /**
+   * Calculate resize dimensions for Phi3-V model.
+   * Based on vlm_utils.cc CalculateResizeShape
+   */
+  private calculateResizeShape(
+    imageHeight: number,
+    imageWidth: number,
+  ): [number, number] {
+    const hdNum = 16;
+    const ratio = imageWidth / imageHeight;
+    let scale = 1;
+    while (scale * Math.ceil(scale / ratio) <= hdNum) {
+      scale += 1;
+    }
+    scale -= 1;
+    const newW = scale * 336;
+    const newH = Math.floor(newW / ratio);
+    return [newH, newW];
+  }
+
+  /**
+   * Calculate crop dimensions for Phi3-V model.
+   * Based on vlm_utils.cc CalculateCropShape / CalculatePadShape
+   */
+  private calculateCropShape(
+    imageHeight: number,
+    imageWidth: number,
+  ): [number, number] {
+    const [resizedHeight, resizedWidth] = this.calculateResizeShape(
+      imageHeight,
+      imageWidth,
+    );
+    const padH = Math.ceil(resizedHeight / 336) * 336;
+    const padW = resizedWidth;
+    return [Math.floor(padH / 336), Math.floor(padW / 336)];
+  }
+
+  /**
    * Embed an image input.
    */
   private async getImageEmbeddings(
     inputImage: ImageURL,
-  ): Promise<tvmjs.NDArray> {
+  ): Promise<tvmjs.Tensor> {
     this.tvm.beginScope();
-    // 1. Transform ImageURL into image input in NDArray
+    // 1. Transform ImageURL into image input in TVMArray
     const url = inputImage.url;
     // url starting with `data:image` and `http` share the same loading method
     const imgData: ImageData = await getImageDataFromURL(url);
     const pixelValues: Uint8ClampedArray = getRGBArrayFromImageData(imgData);
     const pixelArray = this.tvm
-      // .empty([imgData.height, imgData.width, 3], "uint8", this.device)
       .empty([imgData.height, imgData.width, 3], "uint32", this.device)
       .copyFrom(pixelValues)
       .view([1, imgData.height, imgData.width, 3]); // NHWC
 
-    // 2. Call image embed kernel
-    const embed: tvmjs.NDArray = this.tvm.detachFromCurrentScope(
-      this.image_embed!(pixelArray, this.params),
+    // 2. Calculate resize and crop dimensions
+    const [resizeH, resizeW] = this.calculateResizeShape(
+      imgData.height,
+      imgData.width,
+    );
+    const [cropH, cropW] = this.calculateCropShape(
+      imgData.height,
+      imgData.width,
+    );
+    const resizeHeightShape = this.tvm.makeShapeTuple([resizeH]);
+    const resizeWidthShape = this.tvm.makeShapeTuple([resizeW]);
+    const cropHeightShape = this.tvm.makeShapeTuple([cropH]);
+    const cropWidthShape = this.tvm.makeShapeTuple([cropW]);
+
+    // 3. embed kernel
+    const embed: tvmjs.Tensor = this.tvm.detachFromCurrentScope(
+      this.image_embed!(
+        pixelArray,
+        resizeHeightShape,
+        resizeWidthShape,
+        cropHeightShape,
+        cropWidthShape,
+        this.params,
+      ),
     );
     if (embed.shape[0] !== IMAGE_EMBED_SIZE) {
       throw new Error(
@@ -880,14 +1035,14 @@ export class LLMChatPipeline {
    *
    * @param inputData data to embed and forward
    * @param inputDataLen length of this inputData, should smaller than prefill chunk size.
-   * @returns The logits returned by this forward as tvmjs.NDArray on GPU.
+   * @returns The logits returned by this forward as tvmjs.Tensor on GPU.
    *
    * @note Precondition: inputData's data length is smaller than prefill chunk size
    */
   private async embedAndForward(
     inputData: Array<Array<number> | ImageURL>,
     inputDataLen: number,
-  ): Promise<tvmjs.NDArray> {
+  ): Promise<tvmjs.Tensor> {
     if (inputDataLen > this.prefillChunkSize) {
       throw new Error(
         "InternalError: expect inputDataLen <= this.prefillChunkSize.",
@@ -898,7 +1053,7 @@ export class LLMChatPipeline {
 
     // 1. Embed all inputData
     this.tvm.beginScope();
-    const embeddings: tvmjs.NDArray[] = [];
+    const embeddings: tvmjs.Tensor[] = [];
     for (let i = 0; i < inputData.length; i++) {
       const data = inputData[i];
       if (Array.isArray(data)) {
@@ -909,7 +1064,7 @@ export class LLMChatPipeline {
     }
 
     // 2. Concatenate embeddings
-    let allEmbeddings: tvmjs.NDArray;
+    let allEmbeddings: tvmjs.Tensor;
     if (embeddings.length === 1) {
       allEmbeddings = embeddings[0];
     } else {
@@ -943,7 +1098,7 @@ export class LLMChatPipeline {
   }
 
   // NOTE: caller must call device.sync()
-  private updateLogitsOnCPU(logits: tvmjs.NDArray): tvmjs.NDArray {
+  private updateLogitsOnCPU(logits: tvmjs.Tensor): tvmjs.Tensor {
     if (this.logitsOnCPU == undefined) {
       this.logitsOnCPU = this.tvm.detachFromCurrentScope(
         this.tvm.empty(logits.shape, logits.dtype, this.tvm.cpu()),
@@ -958,7 +1113,7 @@ export class LLMChatPipeline {
   }
 
   private async sampleTokenFromLogits(
-    logitsOnGPU: tvmjs.NDArray,
+    logitsOnGPU: tvmjs.Tensor,
     genConfig?: GenerationConfig,
   ) {
     // 0. Get value of temperature, top_p, and various penalties, possibly overridden by genConfig
@@ -984,6 +1139,12 @@ export class LLMChatPipeline {
       if (_hasValue(genConfig.top_p)) {
         top_p = genConfig.top_p!;
       }
+      // TODO: setting top_p to 1.0 by default might run into issues since
+      // top_p masking in relax uses < instead of <=
+      // Set default top_p to 1.0 if not set
+      if (!_hasValue(top_p)) {
+        top_p = 1.0;
+      }
       if (_hasValue(genConfig.repetition_penalty)) {
         repetition_penalty = genConfig.repetition_penalty!;
       }
@@ -993,12 +1154,18 @@ export class LLMChatPipeline {
       if (_hasValue(genConfig.presence_penalty)) {
         presence_penalty = genConfig.presence_penalty!;
       }
-      // If only one of frequency or presence penatly is set, make the other one 0.0
+      // If only one of frequency or presence penalty is set, make the other one 0.0
       if (_hasValue(frequency_penalty) && !_hasValue(presence_penalty)) {
         presence_penalty = 0.0;
       }
       if (_hasValue(presence_penalty) && !_hasValue(frequency_penalty)) {
         frequency_penalty = 0.0;
+      }
+      if (!_hasValue(frequency_penalty)) {
+        frequency_penalty = 0.0;
+      }
+      if (!_hasValue(presence_penalty)) {
+        presence_penalty = 0.0;
       }
       if (_hasValue(genConfig.logit_bias)) {
         logit_bias = genConfig.logit_bias!;
@@ -1036,11 +1203,16 @@ export class LLMChatPipeline {
       throw new RangeError("presence_penalty", -2.0, 2.0);
     }
 
-    // 0. Update logitsOnGPU with on-GPU grammar bitmasking
-    if (
+    const outputTokenBegin = performance.now();
+    const grammarConstrained =
       response_format?.type === "json_object" ||
-      response_format?.type === "grammar"
-    ) {
+      response_format?.type === "grammar" ||
+      response_format?.type === "structural_tag";
+
+    // 0. Update logitsOnGPU with on-GPU grammar bitmasking
+    if (grammarConstrained) {
+      const grammarBitmaskBegin = performance.now();
+
       this.tvm.beginScope();
       if (this.grammarMatcher === undefined) {
         throw Error("Expect grammar matcher to be initialized.");
@@ -1070,118 +1242,235 @@ export class LLMChatPipeline {
         bitMaskOnGPU,
       );
       this.tvm.endScope();
+
+      if (genConfig?.enable_latency_breakdown) {
+        const grammarBitmaskEnd = performance.now();
+        const grammarBitmaskTimeSpent =
+          (grammarBitmaskEnd - grammarBitmaskBegin) / 1e3;
+        this.curRoundLatencyBreakdown.grammarBitmaskTime.push(
+          grammarBitmaskTimeSpent,
+        );
+      }
     }
 
-    // 1. Move logits to CPU
-    this.tvm.beginScope();
-    this.updateLogitsOnCPU(logitsOnGPU);
-    this.tvm.endScope();
-    await this.device.sync();
+    // 1. Apply logitProcessor on CPU
+    if (this.logitProcessor !== undefined) {
+      // Move logits to CPU
+      this.tvm.beginScope();
+      this.updateLogitsOnCPU(logitsOnGPU);
+      this.tvm.endScope();
+      await this.device.sync();
 
-    if (this.logitsOnCPU == undefined) {
-      throw Error("logits should be assigned");
-    }
+      const logitProcessorBegin = performance.now();
 
-    // 2. Post process logits via logitProcessor and/or logit_bias
-    if (this.logitProcessor !== undefined || _hasValue(logit_bias)) {
+      if (this.logitsOnCPU == undefined) {
+        throw Error("logits should be assigned");
+      }
       let logitsOnCPUArray: Float32Array = <Float32Array>(
         this.logitsOnCPU.toArray()
       );
-      const vocab_size = logitsOnCPUArray.length;
-      if (this.logitProcessor !== undefined) {
-        logitsOnCPUArray = this.logitProcessor.processLogits(logitsOnCPUArray);
-      }
-      if (_hasValue(logit_bias)) {
-        for (const tokenID in logit_bias) {
-          const curBias = logit_bias[tokenID];
-          const curTokenID = parseInt(tokenID);
-          if (curTokenID > vocab_size) {
-            throw Error(
-              "Token " +
-                curTokenID +
-                " in logit_bias exceeds vocab_size " +
-                vocab_size,
-            );
-          }
-          logitsOnCPUArray[curTokenID] += curBias;
-        }
-      }
+      logitsOnCPUArray = this.logitProcessor.processLogits(logitsOnCPUArray);
+      logitsOnGPU.copyFrom(logitsOnCPUArray);
       this.logitsOnCPU.copyFrom(logitsOnCPUArray);
+
+      if (genConfig?.enable_latency_breakdown) {
+        const logitProcessorEnd = performance.now();
+        const logitProcessorTimeSpent =
+          (logitProcessorEnd - logitProcessorBegin) / 1e3;
+        this.curRoundLatencyBreakdown.logitProcessorTime.push(
+          logitProcessorTimeSpent,
+        );
+      }
     }
 
-    // 3. Apply penalties to logits
-    if (_hasValue(frequency_penalty) && _hasValue(presence_penalty)) {
-      // 3.1. Use frequency and presence penalty
+    // 2. Apply logit_bias on GPU
+    if (_hasValue(logit_bias)) {
+      const logitBiasBegin = performance.now();
+
+      const numTokens = Object.keys(logit_bias ?? {}).length;
+      const pos2seqIds = new Int32Array(numTokens).fill(0);
+      const tokenIds = new Int32Array(numTokens);
+      const tokenLogitBias = new Float32Array(numTokens);
+
+      const logitBiasKeys = Object.keys(logit_bias ?? {});
+      for (let index = 0; index < numTokens; index++) {
+        const tokenId = parseInt(logitBiasKeys[index]);
+        tokenIds[index] = tokenId;
+        tokenLogitBias[index] = logit_bias![tokenId];
+      }
+
       this.tvm.beginScope();
-      // Both `keys()` and `values()` are in insertion order.
+
+      const pos2seqIdsDevice = this.tvm
+        .empty([numTokens], "int32", this.device)
+        .copyFrom(pos2seqIds);
+
+      const tokenIdsDevice = this.tvm
+        .empty([numTokens], "int32", this.device)
+        .copyFrom(tokenIds);
+
+      const tokenLogitBiasDevice = this.tvm
+        .empty([numTokens], "float32", this.device)
+        .copyFrom(tokenLogitBias);
+
+      this.fapplyLogitBias(
+        logitsOnGPU.view([1, this.fullVocabSize]),
+        pos2seqIdsDevice,
+        tokenIdsDevice,
+        tokenLogitBiasDevice,
+      );
+
+      this.tvm.endScope();
+
+      if (genConfig?.enable_latency_breakdown) {
+        const logitBiasEnd = performance.now();
+        const logitBiasTimeSpent = (logitBiasEnd - logitBiasBegin) / 1e3;
+        this.curRoundLatencyBreakdown.logitBiasTime.push(logitBiasTimeSpent);
+      }
+    }
+
+    // 3. Apply penalties to logits on GPU
+    if (
+      frequency_penalty != 0.0 ||
+      presence_penalty != 0.0 ||
+      repetition_penalty != 1.0
+    ) {
       const appearedTokens = [...this.appearedTokensFreq.keys()];
       const appearedTokensFreqs = [...this.appearedTokensFreq.values()];
-      const appeared_tokens_ndarray = this.tvm.empty(
-        [1, appearedTokens.length],
-        "int32",
-        this.tvm.cpu(),
-      );
-      const appeared_tokens_freqs_ndarray = this.tvm.empty(
-        [1, appearedTokensFreqs.length],
-        "int32",
-        this.tvm.cpu(),
-      );
-      appeared_tokens_ndarray.copyFrom(appearedTokens);
-      appeared_tokens_freqs_ndarray.copyFrom(appearedTokensFreqs);
-      this.tvm.applyPresenceAndFrequencyPenalty(
-        this.logitsOnCPU,
-        appeared_tokens_ndarray,
-        appeared_tokens_freqs_ndarray,
-        presence_penalty!,
-        frequency_penalty!,
-      );
-      this.tvm.endScope();
-    } else if (repetition_penalty != 1.0) {
-      // 3.2. Use repetition penalty
-      this.tvm.beginScope();
-      const appearedTokens = [...this.appearedTokensFreq.keys()];
-      const appeared_tokens_ndarray = this.tvm.empty(
-        [1, appearedTokens.length],
-        "int32",
-        this.tvm.cpu(),
-      );
-      appeared_tokens_ndarray.copyFrom(appearedTokens);
-      this.tvm.applyRepetitionPenalty(
-        this.logitsOnCPU,
-        appeared_tokens_ndarray,
-        repetition_penalty,
-      );
-      this.tvm.endScope();
+
+      const numTokens = appearedTokens.length;
+
+      if (numTokens > 0) {
+        const penaltyBegin = performance.now();
+
+        const pos2seqIds = new Int32Array(numTokens).fill(0);
+        const tokenIds = new Int32Array(numTokens).fill(0);
+        const tokenCnt = new Int32Array(numTokens).fill(0);
+        const penalties = new Float32Array([
+          presence_penalty,
+          frequency_penalty,
+          repetition_penalty,
+        ]);
+
+        tokenIds.set(appearedTokens);
+        tokenCnt.set(appearedTokensFreqs);
+
+        this.tvm.beginScope();
+        const seqIdsArray = this.tvm
+          .empty([1], "int32", this.device)
+          .copyFrom([0]);
+
+        const pos2seqIdsDevice = this.tvm
+          .empty([numTokens], "int32", this.device)
+          .copyFrom(pos2seqIds);
+
+        const tokenIdsDevice = this.tvm
+          .empty([numTokens], "int32", this.device)
+          .copyFrom(tokenIds);
+
+        const tokenCntDevice = this.tvm
+          .empty([numTokens], "int32", this.device)
+          .copyFrom(tokenCnt);
+
+        const penaltiesDevice = this.tvm
+          .empty([1, 3], "float32", this.device)
+          .copyFrom(penalties);
+
+        this.fapplyPenalty(
+          logitsOnGPU.view([1, this.fullVocabSize]),
+          seqIdsArray,
+          pos2seqIdsDevice,
+          tokenIdsDevice,
+          tokenCntDevice,
+          penaltiesDevice,
+        );
+
+        this.tvm.endScope();
+
+        if (genConfig?.enable_latency_breakdown) {
+          const penaltyEnd = performance.now();
+          const penaltyTimeSpent = (penaltyEnd - penaltyBegin) / 1e3;
+          this.curRoundLatencyBreakdown.penaltyTime.push(penaltyTimeSpent);
+        }
+      }
     }
 
+    // TODO: Explore usage of multinomial sampling kernel (currently blocked due to usage
+    // of i8) for cases where top_p is not set
     // 4. Sample token from logits
-    // If logprobs, need the actual distribution via softmax, otherwise directly sample from logits
-    let sampledToken: number;
-    if (logprobs) {
-      // Inplace transform logitsOnCPU to a distribution
-      temperature = Math.max(1e-6, temperature); // to prevent division by zero
-      this.tvm.applySoftmaxWithTemperature(this.logitsOnCPU, temperature);
-      sampledToken = this.tvm.sampleTopPFromProb(this.logitsOnCPU, top_p);
+    const sampleBegin = performance.now();
+
+    // Inplace transform logitsOnCPU to a distribution
+    temperature = Math.max(1e-6, temperature); // to prevent division by zero
+
+    const numSeqs = 1;
+    const numProbs = 1;
+
+    const temperatures = new Float32Array([temperature]);
+
+    this.tvm.beginScope();
+    const temperaturesDevice = this.tvm
+      .empty([numSeqs], "float32", this.device)
+      .copyFrom(temperatures);
+
+    let probs = this.fsoftmaxWithTemperature(
+      logitsOnGPU.view([numSeqs, numProbs, this.fullVocabSize]),
+      temperaturesDevice,
+    );
+    probs = probs.view([numProbs, this.fullVocabSize]);
+
+    const argsortResults = this.fargsortProbs(probs);
+    const sortedProbsDevice = argsortResults.get(0);
+    const sortedIndicesDevice = argsortResults.get(1);
+
+    const uniformSamplesDevice = this.tvm.uniform([1], 0.0, 1.0, this.device);
+
+    const topPHost = new Float32Array(numProbs).fill(-1);
+    const topPValue = Math.max(top_p, 1e-5);
+    this.sampleIndices.forEach((row) => {
+      topPHost[row] = topPValue;
+    });
+    this.topPDevice.copyFrom(topPHost);
+
+    const sampledTokensDevice = this.tvm.detachFromCurrentScope(
+      this.fsampleWithTopP(
+        sortedProbsDevice,
+        sortedIndicesDevice,
+        uniformSamplesDevice,
+        this.sampleIndicesDevice,
+        this.topPDevice,
+      ),
+    );
+    const sampledTokensHost = this.tvm.detachFromCurrentScope(
+      this.tvm
+        .empty([numSeqs], "int32", this.tvm.cpu())
+        .copyFrom(sampledTokensDevice),
+    );
+    if (logprobs && top_logprobs! > 0) {
+      this.updateLogitsOnCPU(probs);
+    }
+    this.tvm.endScope();
+    await this.device.sync();
+
+    const sampledToken = sampledTokensHost.toArray()[0];
+
+    if (logprobs && top_logprobs! > 0) {
       this.tokenLogprobArray.push(
         this.getTokenLogprob(sampledToken, top_logprobs!),
       );
-    } else {
-      // temperature being 0 is allowed here, equivalent to argmax
-      sampledToken = this.tvm.sampleTopPFromLogits(
-        this.logitsOnCPU,
-        temperature,
-        top_p,
-      );
+    }
+
+    if (genConfig?.enable_latency_breakdown) {
+      const sampleEnd = performance.now();
+      const sampleTimeSpent = (sampleEnd - sampleBegin) / 1e3;
+      this.curRoundLatencyBreakdown.sampleTime.push(sampleTimeSpent);
     }
 
     // 5. Update logit processor
     this.logitProcessor?.processSampledToken(sampledToken);
 
     // 6. Update grammar matcher with new token
-    if (
-      response_format?.type === "json_object" ||
-      response_format?.type === "grammar"
-    ) {
+    if (grammarConstrained) {
       if (this.grammarMatcher === undefined) {
         throw Error("Expect grammar matcher to be initialized.");
       }
@@ -1192,6 +1481,12 @@ export class LLMChatPipeline {
       if (!accepted) {
         throw Error("Grammar matcher rejected the newly sampled token.");
       }
+    }
+
+    if (genConfig?.enable_latency_breakdown) {
+      const outputTokenEnd = performance.now();
+      const outputTokenTimeSpent = (outputTokenEnd - outputTokenBegin) / 1e3;
+      this.curRoundLatencyBreakdown.totalTime.push(outputTokenTimeSpent);
     }
 
     return sampledToken;
@@ -1311,7 +1606,7 @@ export class LLMChatPipeline {
     const chunkLens: Array<number> = retGetChunks[1];
 
     // 2. Prefill each chunk
-    let logitsOnGPU: tvmjs.NDArray;
+    let logitsOnGPU: tvmjs.Tensor;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const chunkLen = chunkLens[i];
@@ -1415,7 +1710,7 @@ export class LLMChatPipeline {
     }
 
     this.tvm.beginScope();
-    const prefillChunk: Array<Array<number>> = [tokens];
+    const prefillChunk: Array<Array<number>> = [tokens] as Array<Array<number>>;
     const prefillChunkLen = tokens.length;
     const prefillStart = performance.now();
     await this.embedAndForward(prefillChunk, prefillChunkLen);
