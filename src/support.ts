@@ -140,6 +140,27 @@ export function getToolCallFromOutputMessage(
 ):
   | Array<ChatCompletionMessageToolCall>
   | Array<ChatCompletionChunk.Choice.Delta.ToolCall> {
+  if (typeof outputMessage === "string") {
+    // Patch for Qwen3 output format
+    // 1. Strip out everything between <think> and </think> (and the tags themselves)
+    outputMessage = outputMessage
+      .replace(/<think>[\s\S]*?<\/think>\n*/g, "")
+      .trim();
+
+    // 2. Strip markdown formatting if Qwen3 wraps the JSON in code ticks
+    if (outputMessage.startsWith("```json")) {
+      outputMessage = outputMessage
+        .replace(/^```json/, "")
+        .replace(/```$/, "")
+        .trim();
+    } else if (outputMessage.startsWith("```")) {
+      outputMessage = outputMessage
+        .replace(/^```/, "")
+        .replace(/```$/, "")
+        .trim();
+    }
+  }
+
   // 1. Parse outputMessage to JSON object
   let toolCallsObject;
   try {
