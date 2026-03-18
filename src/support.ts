@@ -147,7 +147,7 @@ export function getToolCallFromOutputMessage(
       .replace(/<think>[\s\S]*?<\/think>\n*/g, "")
       .trim();
 
-    // 2. Strip markdown formatting if Qwen3 wraps the JSON in code ticks
+    // 2. Strip markdown formatting
     if (outputMessage.startsWith("```json")) {
       outputMessage = outputMessage
         .replace(/^```json/, "")
@@ -166,12 +166,14 @@ export function getToolCallFromOutputMessage(
   try {
     toolCallsObject = JSON.parse(outputMessage);
   } catch (err) {
-    throw new ToolCallOutputParseError(outputMessage, err as Error);
+    // Return an empty array so it doesn't crash the worker.
+    console.error(new ToolCallOutputParseError(outputMessage, err as Error));
+    return [];
   }
 
-  // 2. Expect to be an array
+  // 2. Expect to be an array (Qwen3 often outputs a single object, so we wrap it safely)
   if (!(toolCallsObject instanceof Array)) {
-    throw new ToolCallOutputInvalidTypeError("array");
+    toolCallsObject = [toolCallsObject];
   }
 
   // 3. Parse each tool call and populate tool_calls
@@ -180,14 +182,20 @@ export function getToolCallFromOutputMessage(
   for (let id = 0; id < numToolCalls; id++) {
     const curToolCall = toolCallsObject[id];
     if (curToolCall.name === undefined || curToolCall.arguments === undefined) {
-      throw new ToolCallOutputMissingFieldsError(
-        ["name", "arguments"],
-        curToolCall,
+      console.error(
+        new ToolCallOutputMissingFieldsError(
+          ["name", "arguments"],
+          curToolCall,
+        ),
       );
+      return [];
     }
     tool_calls.push({
       name: curToolCall.name,
-      arguments: JSON.stringify(curToolCall.arguments),
+      arguments:
+        typeof curToolCall.arguments === "string"
+          ? curToolCall.arguments
+          : JSON.stringify(curToolCall.arguments),
     });
   }
 
