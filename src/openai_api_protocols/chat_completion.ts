@@ -592,6 +592,12 @@ export function postInitAndCheckFields(
     }
   }
 
+  // 7.3 Hard coded support for Qwen3
+  // TODO: add hard coded support for the qwen model
+  if (currentModelId.startsWith("Qwen3-")) {
+
+  }
+
   // 8. Only set stream_options when streaming
   if (request.stream_options !== undefined && request.stream_options !== null) {
     if (!request.stream) {
