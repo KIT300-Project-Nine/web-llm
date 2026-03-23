@@ -24,6 +24,7 @@ import {
 import {
   officialHermes2FunctionCallSchemaArray,
   hermes2FunctionCallingSystemPrompt,
+  qwenFunctionCallingSystemPrompt,
 } from "../support";
 import {
   CustomResponseFormatError,
@@ -588,6 +589,32 @@ export function postInitAndCheckFields(
       request.messages.unshift({
         role: "system",
         content: hermes2SystemMessage,
+      } as ChatCompletionSystemMessageParam);
+    }
+
+    // 7.3 Hard coded support for Qwen models
+    if (currentModelId.toLowerCase().includes("qwen")) {
+      // Note: We DO NOT force request.response_format to "json_object" here
+      // because Qwen will output <tool_call> text wrappers, which violates strict JSON mode.
+
+      // Modify system prompt to provide tools usage
+      const qwenSystemMessage = qwenFunctionCallingSystemPrompt.replace(
+        MessagePlaceholders.hermes_tools,
+        JSON.stringify(request.tools),
+      );
+
+      // Make sure user did not provide system message already
+      for (let i = 0; i < request.messages.length; i++) {
+        const message: ChatCompletionMessageParam = request.messages[i];
+        if (message.role === "system") {
+          throw new CustomSystemPromptError();
+        }
+      }
+
+      // Prepend a message for hardcoded system prompt
+      request.messages.unshift({
+        role: "system",
+        content: qwenSystemMessage,
       } as ChatCompletionSystemMessageParam);
     }
   }

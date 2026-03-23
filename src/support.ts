@@ -121,6 +121,18 @@ Use the following pydantic model json schema for each tool call you will make:
 ${officialHermes2FunctionCallSchema} For each function call return a json object.`;
 
 /**
+ * Full system prompt for Qwen function calling.
+ */
+export const qwenFunctionCallingSystemPrompt = `You are a helpful data assistant. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. 
+Here are the available tools: <tools> ${MessagePlaceholders.hermes_tools} </tools>. 
+If you need to use a tool, you MUST output your tool call inside <tool_call> tags. 
+Example:
+<tool_call>
+{"name": "tool_name", "arguments": {"arg": "value"}}
+</tool_call>
+If you do not need a tool, do not use the <tool_call> tags and simply reply conversationally.`;
+
+/**
  * Given a string outputMessage, parse it as a JSON object and return an array of tool calls.
  *
  * Expect outputMessage to be a valid JSON string, and expect it to be an array of Function with
@@ -141,13 +153,20 @@ export function getToolCallFromOutputMessage(
   | Array<ChatCompletionMessageToolCall>
   | Array<ChatCompletionChunk.Choice.Delta.ToolCall> {
   if (typeof outputMessage === "string") {
-    // Patch for Qwen3 output format
-    // 1. Strip out everything between <think> and </think> (and the tags themselves)
+    // 1. Strip out everything between <think> and </think>
     outputMessage = outputMessage
       .replace(/<think>[\s\S]*?<\/think>\n*/g, "")
       .trim();
 
-    // 2. Strip markdown formatting
+    // 2. Extract the JSON from <tool_call> tags if Qwen used them
+    const toolCallMatch = outputMessage.match(
+      /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/,
+    );
+    if (toolCallMatch) {
+      outputMessage = toolCallMatch[1].trim();
+    }
+
+    // 3. Strip markdown formatting
     if (outputMessage.startsWith("```json")) {
       outputMessage = outputMessage
         .replace(/^```json/, "")
