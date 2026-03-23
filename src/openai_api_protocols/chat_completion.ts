@@ -551,7 +551,12 @@ export function postInitAndCheckFields(
   // 7. Function calling hardcoded handlings
   if (request.tools !== undefined && request.tools !== null) {
     // 7.1 Check if model supports function calling
-    if (!functionCallingModelIds.includes(currentModelId)) {
+    const supportsFunctionCalling = functionCallingModelIds.some(
+      (supportedModelId) =>
+        currentModelId === supportedModelId ||
+        currentModelId.startsWith(supportedModelId),
+    );
+    if (!supportsFunctionCalling) {
       throw new UnsupportedModelIdError(
         currentModelId,
         functionCallingModelIds,
@@ -603,19 +608,22 @@ export function postInitAndCheckFields(
         JSON.stringify(request.tools),
       );
 
-      // Make sure user did not provide system message already
-      for (let i = 0; i < request.messages.length; i++) {
-        const message: ChatCompletionMessageParam = request.messages[i];
-        if (message.role === "system") {
-          throw new CustomSystemPromptError();
-        }
-      }
+      // Keep user persona as the primary system message when present.
+      const systemMsgIndex = request.messages.findIndex(
+        (message: ChatCompletionMessageParam) => message.role === "system",
+      );
 
-      // Prepend a message for hardcoded system prompt
-      request.messages.unshift({
-        role: "system",
-        content: qwenSystemMessage,
-      } as ChatCompletionSystemMessageParam);
+      if (systemMsgIndex !== -1) {
+        request.messages.splice(systemMsgIndex + 1, 0, {
+          role: "system",
+          content: qwenSystemMessage,
+        } as ChatCompletionSystemMessageParam);
+      } else {
+        request.messages.unshift({
+          role: "system",
+          content: qwenSystemMessage,
+        } as ChatCompletionSystemMessageParam);
+      }
     }
   }
 
