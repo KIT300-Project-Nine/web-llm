@@ -154,29 +154,6 @@ const engine = new MLCEngine({
 await engine.reload(selectedModel);
 ```
 
-### Cache Backend Policy
-
-WebLLM supports three cache backends through `AppConfig.cacheBackend`:
-
-- `"cache"`: browser [Cache API](https://developer.mozilla.org/en-US/docs/Web/API/Cache) (default).
-- `"indexeddb"`: browser [IndexedDB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API).
-- `"cross-origin"`: experimental Chrome [Cross-Origin Storage API](https://github.com/WICG/cross-origin-storage) extension backend. Install the [Cross-Origin Storage extension](https://chromewebstore.google.com/detail/cross-origin-storage/denpnpcgjgikjpoglpjefakmdcbmlgih) to use it. (If the extension isn't installed, WebLLM falls back to the default cache automatically.)
-
-Example:
-
-```typescript
-import { CreateMLCEngine, prebuiltAppConfig } from "@mlc-ai/web-llm";
-
-const appConfig = { ...prebuiltAppConfig, cacheBackend: "cross-origin" };
-const engine = await CreateMLCEngine("Llama-3.1-8B-Instruct-q4f32_1-MLC", {
-  appConfig,
-});
-```
-
-Notes:
-- The `"cross-origin"` backend requires installing and enabling a compatible browser extension.
-- Cross-origin backend currently does not support programmatic tensor-cache deletion; clearing is extension-managed.
-
 ### Chat Completion
 
 After successfully initializing the engine, you can now invoke chat completions using OpenAI style chat APIs through the `engine.chat.completions` interface. For the full list of parameters and their descriptions, check [section below](#full-openai-compatibility) and [OpenAI API reference](https://platform.openai.com/docs/api-reference/chat/create).
@@ -338,58 +315,15 @@ WebLLM is designed to be fully compatible with [OpenAI API](https://platform.ope
 - [seed-to-reproduce](examples/seed-to-reproduce): use seeding to ensure a reproducible output with fields `seed`.
 - [function-calling](examples/function-calling) (WIP): function calling with fields `tools` and `tool_choice` (with preliminary support); or manual function calling without `tools` or `tool_choice` (keeps the most flexibility).
 
-## Integrity Verification
+For Qwen-style function-calling models, WebLLM expects tool calls in an XML envelope:
 
-WebLLM supports optional integrity verification for model artifacts using
-[SRI (Subresource Integrity)](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity) hashes.
-When the `integrity` field is set on a `ModelRecord`, WebLLM will verify the downloaded config,
-WASM, and tokenizer files against the provided hashes before loading.
-
-```typescript
-import { CreateMLCEngine } from "@mlc-ai/web-llm";
-
-const appConfig = {
-  model_list: [
-    {
-      model: "https://huggingface.co/mlc-ai/Llama-3.2-1B-Instruct-q4f16_1-MLC",
-      model_id: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
-      model_lib:
-        "https://raw.githubusercontent.com/user/model-libs/main/model.wasm",
-      integrity: {
-        config: "sha256-<base64-hash-of-mlc-chat-config.json>",
-        model_lib: "sha256-<base64-hash-of-wasm-file>",
-        tokenizer: {
-          "tokenizer.json": "sha256-<base64-hash-of-tokenizer.json>",
-        },
-        onFailure: "error", // "error" (default) throws IntegrityError, "warn" logs and continues
-      },
-    },
-  ],
-};
-
-const engine = await CreateMLCEngine("Llama-3.2-1B-Instruct-q4f16_1-MLC", {
-  appConfig,
-});
+```text
+<tool_call>
+{"name":"tool_name","arguments":{...}}
+</tool_call>
 ```
 
-You can generate SRI hashes for model files with:
-
-```bash
-# SHA-256
-openssl dgst -sha256 -binary <file> | openssl base64 -A | sed 's/^/sha256-/'
-# SHA-384
-openssl dgst -sha384 -binary <file> | openssl base64 -A | sed 's/^/sha384-/'
-# SHA-512
-openssl dgst -sha512 -binary <file> | openssl base64 -A | sed 's/^/sha512-/'
-```
-
-> The `openssl` commands require a Unix-like shell (macOS/Linux). On Windows, run `openssl` via [Git Bash](https://gitforwindows.org/) or [WSL](https://learn.microsoft.com/en-us/windows/wsl/).
-
-If a hash does not match, an `IntegrityError` is thrown (or a warning is logged when `onFailure: "warn"`).
-All fields in `integrity` are optional — only specified artifacts will be verified.
-When the `integrity` field is omitted entirely, WebLLM behaves exactly as before (no verification).
-
-See the [integrity-verification example](examples/integrity-verification/) for a complete working demo.
+Reasoning text inside `<think>...</think>` is parsed safely during function-calling. If `extra_body.enable_thinking` is `true`, non-Qwen models can preserve thinking text in `message.content`; Qwen variants still strip `<think>` tags during tool parsing to keep tool-call extraction robust.
 
 ## Custom Models
 
@@ -454,7 +388,7 @@ npm install
 npm run build
 ```
 
-Then, to test the effects of your code change in an example, inside `examples/get-started/package.json`, change from `"@mlc-ai/web-llm": "^0.2.82"` to `"@mlc-ai/web-llm": ../..`.
+Then, to test the effects of your code change in an example, inside `examples/get-started/package.json`, change from `"@mlc-ai/web-llm": "^0.2.81"` to `"@mlc-ai/web-llm": ../..`.
 
 Then run:
 
@@ -480,6 +414,7 @@ WebLLM's runtime largely depends on TVMjs: https://github.com/apache/tvm/tree/ma
 While it is also available as an npm package: https://www.npmjs.com/package/@mlc-ai/web-runtime, you can build it from source if needed by following the steps below.
 
 1. Install [emscripten](https://emscripten.org). It is an LLVM-based compiler that compiles C/C++ source code to WebAssembly.
+
    - Follow the [installation instruction](https://emscripten.org/docs/getting_started/downloads.html#installation-instructions-using-the-emsdk-recommended) to install the latest emsdk.
    - Source `emsdk_env.sh` by `source path/to/emsdk_env.sh`, so that `emcc` is reachable from PATH and the command `emcc` works.
 
