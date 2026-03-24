@@ -5,6 +5,7 @@ import {
   ChatOptions,
   AppConfig,
   prebuiltAppConfig,
+  getCacheBackend,
   GenerationConfig,
   postInitAndCheckGenerationConfigValues,
   Role,
@@ -71,6 +72,7 @@ import {
 } from "./error";
 import { asyncLoadTokenizer } from "./cache_util";
 import { EmbeddingPipeline } from "./embedding";
+import { verifyIntegrity } from "./integrity";
 
 /**
  * Creates `MLCEngine`, and loads `modelId` onto WebGPU.
@@ -259,34 +261,39 @@ export class MLCEngine implements MLCEngineInterface {
         : modelRecord.model_type;
     this.loadedModelIdToModelType.set(modelId, modelType);
 
+    const cacheType = getCacheBackend(this.appConfig);
+
     // instantiate cache
-    let configCache: tvmjs.ArtifactCacheTemplate;
-    if (this.appConfig.useIndexedDBCache) {
-      configCache = new tvmjs.ArtifactIndexedDBCache("webllm/config");
-    } else {
-      configCache = new tvmjs.ArtifactCache("webllm/config");
-    }
+    const configCache = tvmjs.createArtifactCache("webllm/config", {
+      cacheType,
+    });
 
     // load config
     const configUrl = new URL("mlc-chat-config.json", modelUrl).href;
-    const curModelConfig = {
-      ...(await configCache.fetchWithCache(
+    const configData = (await configCache.fetchWithCache(
+      configUrl,
+      "arraybuffer",
+      this.reloadController?.signal,
+    )) as ArrayBuffer;
+    if (modelRecord.integrity?.config) {
+      await verifyIntegrity(
+        configData,
+        modelRecord.integrity.config,
         configUrl,
-        "json",
-        this.reloadController?.signal,
-      )),
+        modelRecord.integrity.onFailure,
+      );
+    }
+    const curModelConfig: ChatConfig = {
+      ...JSON.parse(new TextDecoder().decode(configData)),
       ...modelRecord.overrides,
       ...chatOpts,
     } as ChatConfig;
     this.loadedModelIdToChatConfig.set(modelId, curModelConfig);
 
     // load tvm wasm
-    let wasmCache: tvmjs.ArtifactCacheTemplate;
-    if (this.appConfig.useIndexedDBCache) {
-      wasmCache = new tvmjs.ArtifactIndexedDBCache("webllm/wasm");
-    } else {
-      wasmCache = new tvmjs.ArtifactCache("webllm/wasm");
-    }
+    const wasmCache = tvmjs.createArtifactCache("webllm/wasm", {
+      cacheType,
+    });
 
     const wasmUrl = modelRecord.model_lib;
     if (wasmUrl === undefined) {
@@ -309,6 +316,15 @@ export class MLCEngine implements MLCEngineInterface {
       }
     };
     const wasmSource = await fetchWasmSource();
+
+    if (modelRecord.integrity?.model_lib) {
+      await verifyIntegrity(
+        wasmSource,
+        modelRecord.integrity.model_lib,
+        wasmUrl,
+        modelRecord.integrity.onFailure,
+      );
+    }
 
     const wasm = new Uint8Array(wasmSource);
     const tvm = await tvmjs.instantiate(
@@ -366,15 +382,13 @@ export class MLCEngine implements MLCEngineInterface {
       curModelConfig,
       this.appConfig,
       this.logger,
+      modelRecord.integrity,
     );
-    const cacheType = this.appConfig.useIndexedDBCache ? "indexeddb" : "cache";
-    await tvm.fetchTensorCache(
-      modelUrl,
-      tvm.webgpu(),
-      "webllm/model",
+    await tvm.fetchTensorCache(modelUrl, tvm.webgpu(), {
+      cacheScope: "webllm/model",
       cacheType,
-      this.reloadController?.signal,
-    );
+      signal: this.reloadController?.signal,
+    });
 
     // Instantiate pipeline
     // TODO: would be good to somehow check for error when LLMChatPipeline is loaded for an
@@ -628,15 +642,30 @@ export class MLCEngine implements MLCEngineInterface {
     let tool_calls:
       | Array<ChatCompletionChunk.Choice.Delta.ToolCall>
       | undefined;
+    let outputContent: string | null = null;
+    const enableThinking =
+      "extra_body" in request &&
+      request.extra_body !== undefined &&
+      request.extra_body !== null &&
+      "enable_thinking" in request.extra_body
+        ? request.extra_body.enable_thinking
+        : undefined;
+    const shouldStripThinking =
+      model.toLowerCase().includes("qwen") || enableThinking !== true;
     try {
       if (pipeline.getFinishReason() === "stop" && isFunctionCalling) {
         // If stopped due to length or abort, cannot output return tool_calls field
-        finish_reason = "tool_calls";
         const outputMessage = pipeline.getMessage();
-        tool_calls = getToolCallFromOutputMessage(
+        const parsedOutput = getToolCallFromOutputMessage(
           outputMessage,
           /*isStreaming=*/ true,
-        ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
+          shouldStripThinking,
+        );
+        if (parsedOutput.tool_calls.length > 0) {
+          finish_reason = "tool_calls";
+          tool_calls = parsedOutput.tool_calls;
+          outputContent = parsedOutput.content;
+        }
       }
     } catch (err) {
       await lock.release();
@@ -648,12 +677,14 @@ export class MLCEngine implements MLCEngineInterface {
         id: id,
         choices: [
           {
-            delta: isFunctionCalling
-              ? {
-                  role: "assistant",
-                  tool_calls: tool_calls,
-                }
-              : {},
+            delta:
+              isFunctionCalling && tool_calls !== undefined
+                ? {
+                    role: "assistant",
+                    tool_calls: tool_calls,
+                    content: outputContent,
+                  }
+                : {},
             finish_reason: finish_reason,
             index: 0,
           },
@@ -855,16 +886,25 @@ export class MLCEngine implements MLCEngineInterface {
         const isFunctionCalling =
           request.tools !== undefined && request.tools !== null;
         let tool_calls: Array<ChatCompletionMessageToolCall> | undefined;
+        let messageContent: string | null = outputMessage;
+        const shouldStripThinking =
+          selectedModelId.toLowerCase().includes("qwen") ||
+          request.extra_body?.enable_thinking !== true;
         if (
           selectedPipeline.getFinishReason() === "stop" &&
           isFunctionCalling
         ) {
           // If stopped due to length or abort, cannot output return tool_calls field
-          finish_reason = "tool_calls";
-          tool_calls = getToolCallFromOutputMessage(
+          const parsedOutput = getToolCallFromOutputMessage(
             outputMessage,
             /*isStreaming=*/ false,
+            shouldStripThinking,
           );
+          messageContent = parsedOutput.content;
+          if (parsedOutput.tool_calls.length > 0) {
+            finish_reason = "tool_calls";
+            tool_calls = parsedOutput.tool_calls;
+          }
         }
 
         choices.push({
@@ -875,16 +915,11 @@ export class MLCEngine implements MLCEngineInterface {
                 content: selectedPipeline.getTokenLogprobArray(),
               } as ChatCompletion.Choice.Logprobs)
             : null,
-          message: isFunctionCalling
-            ? {
-                content: null,
-                tool_calls: tool_calls,
-                role: "assistant",
-              }
-            : {
-                content: outputMessage,
-                role: "assistant",
-              },
+          message: {
+            content: messageContent,
+            tool_calls: tool_calls,
+            role: "assistant",
+          },
         });
         completion_tokens += selectedPipeline.getCurRoundDecodingTotalTokens();
         prompt_tokens += selectedPipeline.getCurRoundPrefillTotalTokens();
